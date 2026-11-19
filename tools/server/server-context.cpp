@@ -3005,7 +3005,10 @@ private:
                     }
 
                     // the task is not deferred past this point
-                    if (plan.update_cache && prompt_cache) {
+                    // also go through the cache when it holds a longer prefix of this prompt than the slot does,
+                    // e.g. after a short prefix-preparation request left the slot holding a perfect short prefix
+                    if (prompt_cache && !task.is_stateless() &&
+                        (plan.update_cache || prompt_cache->has_better(slot->prompt.tokens, task.tokens))) {
                         update_prompt_cache(*slot, task);
                     }
 
