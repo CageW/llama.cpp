@@ -13912,6 +13912,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 16384, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 40960, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 65536, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 110592, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1024, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 40960, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 110592, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 

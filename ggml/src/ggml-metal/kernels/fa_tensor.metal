@@ -283,6 +283,7 @@ typedef decltype(kernel_flash_attn_ext_tensor<half, half4, 64, 64>) flash_attn_e
 
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk64_dv64"  )]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 64,  64>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk128_dv128")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_tensor_f16_dk128_dv128_t256")]] kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 128, 128, OP_FLASH_ATTN_EXT_TENSOR_D128_NQPSG, OP_FLASH_ATTN_EXT_TENSOR_D128_NCPSG, OP_FLASH_ATTN_EXT_TENSOR_D128_NSG>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk192_dv128")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 192, 128>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk256_dv256")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 256, 256>;
 template [[host_name("kernel_flash_attn_ext_tensor_f16_dk512_dv512")]]  kernel flash_attn_ext_tensor_t kernel_flash_attn_ext_tensor<half, half4, 512, 512, OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE>;

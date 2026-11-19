@@ -1892,7 +1892,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
         bool has_mask,
         bool has_sinks,
         bool has_bias,
-        bool has_scap) {
+        bool has_scap,
+        bool tile_d128) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1903,7 +1904,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
 
     const char * type = op->src[1]->type == GGML_TYPE_BF16 ? "bf16" : "f16";
 
-    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d", type, dk, dv);
+    snprintf(base, 256, "kernel_flash_attn_ext_tensor_%s_dk%d_dv%d%s", type, dk, dv, tile_d128 ? "_t256" : "");
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d", base, has_mask, has_sinks, has_bias, has_scap);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

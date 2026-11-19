@@ -137,6 +137,12 @@
 #define OP_FLASH_ATTN_EXT_TENSOR_NCPSG       64
 #define OP_FLASH_ATTN_EXT_TENSOR_NSG         8
 
+// f16 K/V with dk = dv = 128: 16 queries x 256 cache items x 4 simdgroups per threadgroup
+// (MiniCPM5-15B prefill on M5 Pro, 2 KV heads x GQA 16, 512-token batches: 1.5-1.65x over 32x64x8 at kv 40k-110k)
+#define OP_FLASH_ATTN_EXT_TENSOR_D128_NQPSG  16
+#define OP_FLASH_ATTN_EXT_TENSOR_D128_NCPSG 256
+#define OP_FLASH_ATTN_EXT_TENSOR_D128_NSG     4
+
 #define OP_FLASH_ATTN_EXT_TENSOR_GQA_NQPSG 16
 #define OP_FLASH_ATTN_EXT_TENSOR_GQA_NSG   4
 
