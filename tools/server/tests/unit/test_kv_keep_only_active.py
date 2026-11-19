@@ -89,6 +89,40 @@ def test_clear_and_restore():
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
 
+# a short request that is a prefix of the next prompt truncates the slot to a perfect short prefix (f_keep = 1);
+# the next long prompt must still be restored from cache-ram instead of being re-processed
+def test_short_prefix_request_does_not_block_cache():
+    global server
+    server.n_slots = 1
+    server.kv_unified = False
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_long = res.body["timings"]["prompt_n"]
+
+    tokens = server.make_request("POST", "/tokenize", data={"content": LONG_PROMPT, "add_special": True}).body["tokens"]
+    res = server.make_request("POST", "/completion", data={
+        "prompt": tokens[:len(tokens) // 4],
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    log.drain()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "found better prompt" in log.drain()
+    assert res.body["timings"]["cache_n"] >= n_long - 1
+
+
 def test_disabled_with_flag():
     global server
     server.no_cache_idle_slots = True
