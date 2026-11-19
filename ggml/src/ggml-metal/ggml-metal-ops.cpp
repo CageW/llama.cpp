@@ -972,9 +972,10 @@ static bool ggml_metal_op_mul_mat_use_f16_act(const ggml_tensor * op, bool has_t
 }
 
 // the weights the NAX mat-mat multiplies in int8: the quantized formats, K a multiple of the scale group
-// GGML_METAL_MM_I8_DISABLE keeps them on the f16 operands, which are more accurate
+// mc15: int8 is opt-in (GGML_METAL_MM_I8_ENABLE); by default they stay on the f16 operands, which are more accurate
+// (MiniCPM5-15B quality gate: int8 moved logprobs 1.3-2.9x a llama.cpp version change)
 static bool ggml_metal_op_mul_mat_i8_type(const ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_MM_I8_DISABLE") != nullptr; // read once per process
+    static const bool disabled = getenv("GGML_METAL_MM_I8_ENABLE") == nullptr; // read once per process
 
     return !disabled && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_BF16 &&
         op->src[0]->ne[0] % OP_MUL_MM_I8_G == 0;
