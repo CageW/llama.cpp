@@ -187,7 +187,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        // prefer the entry that leaves the least to recompute (longest common prefix); a short slot that is a
+        // perfect prefix of the new prompt (f_keep = 1) must not block a longer cached entry of the same prompt
+        if (lcp_cur > lcp_best || (lcp_cur == lcp_best && it_best != states.end() && f_keep_best < f_keep_cur)) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
             lcp_best    = lcp_cur;
@@ -246,6 +248,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     return true;
+}
+
+bool server_prompt_cache::has_better(const server_tokens & tokens_slot, const server_tokens & tokens_new) const {
+    const size_t lcp_slot = tokens_slot.get_common_prefix(tokens_new);
+
+    for (const auto & state : states) {
+        const size_t lcp_cur = state.prompt.tokens.get_common_prefix(tokens_new);
+
+        if (lcp_cur > lcp_slot && float(lcp_cur) / state.prompt.tokens.size() >= 0.25f) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void server_prompt_cache::update() {

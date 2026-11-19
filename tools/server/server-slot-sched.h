@@ -93,6 +93,10 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // true if a cached prompt shares a longer prefix with tokens_new than tokens_slot does
+    // (and passes the same "don't trash large prompts" guard as load())
+    bool has_better(const server_tokens & tokens_slot, const server_tokens & tokens_new) const;
+
     void update();
 };
 
