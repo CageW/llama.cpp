@@ -13579,6 +13579,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    // mc15: the fused path with the experts tensor as an offset (4-byte aligned) view, and 9/12 experts non-interleaved
+    test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, true));
+    test_cases.emplace_back(new test_moe_reduce(63,   16, 33, true));
+    test_cases.emplace_back(new test_moe_reduce(2048,  9, 32));
+    test_cases.emplace_back(new test_moe_reduce(2048, 12, 32, false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
