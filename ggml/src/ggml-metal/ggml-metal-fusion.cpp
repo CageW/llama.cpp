@@ -458,7 +458,7 @@ static bool ggml_metal_fusion_check_topk_moe(
         return false;
     }
 
-    int raw_idxs[GGML_METAL_FUSION_MAX];
+    int raw_idxs[GGML_METAL_FUSION_RAW_MAX];
     for (int i = 0; i < raw_count; ++i) {
         raw_idxs[i] = raw_start + i;
         if (gf->nodes[raw_start + i]->op != ops_all[i]) {
@@ -603,7 +603,7 @@ static bool ggml_metal_fusion_check_topk_moe(
     return true;
 }
 
-#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 8
+#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 16
 
 struct ggml_metal_moe_reduce_match {
     const ggml_tensor * experts;
@@ -649,7 +649,7 @@ static bool ggml_metal_fusion_match_moe_reduce(
         }
     }
 
-    int raw_idxs[GGML_METAL_FUSION_MAX];
+    int raw_idxs[GGML_METAL_FUSION_RAW_MAX];
     for (int i = 0; i < raw_count; ++i) {
         raw_idxs[i] = node_idx + i;
         if (gf->nodes[node_idx + i]->op != ops_all[i]) {
@@ -872,33 +872,13 @@ static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_O
 
 static const std::vector<ggml_op> ops_glu_mul_mat = { GGML_OP_GLU, GGML_OP_MUL_MAT };
 
-static const std::vector<ggml_op> ops_moe_reduce_2 = {
-    GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
-};
-static const std::vector<ggml_op> ops_moe_reduce_3 = {
-    GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_ADD
-};
-static const std::vector<ggml_op> ops_moe_reduce_4 = {
-    GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
-    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
-};
-static const std::vector<ggml_op> ops_moe_reduce_5 = {
-    GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
-    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
-};
-static const std::vector<ggml_op> ops_moe_reduce_6 = {
-    GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
-    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
-};
-static const std::vector<ggml_op> ops_moe_reduce_7 = {
-    GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
-    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
-};
-static const std::vector<ggml_op> ops_moe_reduce_8 = {
-    GGML_OP_MUL,
-    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
-    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
-};
+// MUL, one VIEW per expert, one ADD per additional expert
+static std::vector<ggml_op> ggml_metal_ops_moe_reduce(int n_expert_used) {
+    std::vector<ggml_op> ops = { GGML_OP_MUL };
+    ops.insert(ops.end(), n_expert_used,     GGML_OP_VIEW);
+    ops.insert(ops.end(), n_expert_used - 1, GGML_OP_ADD);
+    return ops;
+}
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
@@ -940,13 +920,21 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_TOPK_MOE, ops_topk_moe_sig_norm_bias,       {2}, true, ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE, ops_topk_moe_sig_norm_scale_bias, {2}, true, ggml_metal_fusion_check_topk_moe },
 
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_2, {}, true, ggml_metal_fusion_check_moe_reduce },
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_3, {}, true, ggml_metal_fusion_check_moe_reduce },
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_4, {}, true, ggml_metal_fusion_check_moe_reduce },
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_5, {}, true, ggml_metal_fusion_check_moe_reduce },
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_6, {}, true, ggml_metal_fusion_check_moe_reduce },
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_7, {}, true, ggml_metal_fusion_check_moe_reduce },
-    { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_8, {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(2), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(3), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(4), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(5), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(6), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(7), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(8), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(9), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(10), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(11), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(12), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(13), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(14), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(15), {}, true, ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_MOE_REDUCE, ggml_metal_ops_moe_reduce(16), {}, true, ggml_metal_fusion_check_moe_reduce },
 
     { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
 
@@ -1373,5 +1361,5 @@ int ggml_metal_fusion_max(const ggml_cgraph * gf, int idx) {
     }
 
     // map the matched non-empty nodes back to the raw index span (views are included)
-    return std::min(GGML_METAL_FUSION_MAX, idxs[i_f - 1] - idx + 1);
+    return std::min(GGML_METAL_FUSION_RAW_MAX, idxs[i_f - 1] - idx + 1);
 }

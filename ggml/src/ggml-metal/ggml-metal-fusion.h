@@ -22,6 +22,10 @@ struct ggml_metal_device_props;
 // (also the maximum length of a packed fusion group during graph optimization)
 #define GGML_METAL_FUSION_MAX 16
 
+// raw graph nodes a fusion may span, empty VIEW/RESHAPE nodes included: a MoE reduction over 16 experts is
+// 16 non-empty nodes (MUL + 15 ADD) but 32 raw ones (the 16 expert VIEWs sit between them)
+#define GGML_METAL_FUSION_RAW_MAX (2*GGML_METAL_FUSION_MAX)
+
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
     // already are); a check may skip conditions that differ between batch sizes, and so accept more than FULL
