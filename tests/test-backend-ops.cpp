@@ -9219,6 +9219,29 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// mc15: the mask one prefill ubatch sees - every earlier kv position visible, the last nb positions causal among
+// themselves - so the kernel's block flags skip mask loads the way they do in a real prefill (init_tensor_kq_mask is random)
+struct test_flash_attn_ext_prefill_mask : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",mask_kind=prefill";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * t = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(t));
+        for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+            const int64_t q = r % t->ne[1];
+            for (int64_t k = 0; k < t->ne[0]; ++k) {
+                data[r*t->ne[0] + k] = ggml_fp32_to_fp16(k <= kv - nb + q ? 0.0f : -INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // mask with 2 heads and 2 batches, broadcast over the Q heads and batches
 struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     using test_flash_attn_ext::test_flash_attn_ext;
@@ -14003,6 +14026,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 40960, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 110592, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
+    // mc15: MiniCPM5-15B prefill at the served ubatch (2048 tokens): FA, every MUL_MAT / MUL_MAT_ID of a layer, and the
+    // f16 reference GEMM below and above the 1024-row NAX threshold
+    for (int kv : {2048, 16384, 40960, 110592}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_prefill_mask(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    for (int n : {512, 1024, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
+    }
+    struct mc15_mm { ggml_type type; int m; int k; };
+    for (const mc15_mm & c : std::vector<mc15_mm>{
+             {GGML_TYPE_Q4_K, 4096, 2048},  // attn_q, attn_gate
+             {GGML_TYPE_Q4_K, 256, 2048},   // attn_k, attn_v
+             {GGML_TYPE_Q6_K, 256, 2048},   // attn_v (half the layers)
+             {GGML_TYPE_Q4_K, 2048, 4096},  // attn_output
+             {GGML_TYPE_Q4_K, 512, 2048},   // ffn_up_shexp, ffn_gate_shexp
+             {GGML_TYPE_Q4_K, 2048, 512},   // ffn_down_shexp
+             {GGML_TYPE_Q6_K, 2048, 512},   // ffn_down_shexp (half the layers)
+             {GGML_TYPE_F32, 160, 2048},    // ffn_gate_inp (router)
+             {GGML_TYPE_Q4_K, 8192, 2048},  // layer 0 ffn_up, ffn_gate
+             {GGML_TYPE_Q6_K, 2048, 8192},  // layer 0 ffn_down
+         }) {
+        test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, 2048, c.k, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 2048, 2048));   // ffn_up_exps, ffn_gate_exps
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps (half the layers)
     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
