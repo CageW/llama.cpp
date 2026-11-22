@@ -1478,7 +1478,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_Q4_K:
             {
                 nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
+                nr0 = N_R0_Q4_K_ID;
+
+                // rows of two blocks: each half of the simdgroup takes nr0 rows
+                if (ne00 == 2*ggml_blck_size(GGML_TYPE_Q4_K)) {
+                    nr0 *= 2;
+                    split = true;
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {
@@ -1488,7 +1494,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_Q6_K:
             {
                 nsg = N_SG_Q6_K;
-                nr0 = N_R0_Q6_K;
+                nr0 = N_R0_Q6_K_ID;
             } break;
         case GGML_TYPE_IQ2_XXS:
             {

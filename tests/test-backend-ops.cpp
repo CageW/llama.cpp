@@ -13585,6 +13585,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048,  9, 32));
     test_cases.emplace_back(new test_moe_reduce(2048, 12, 32, false, true));
 
+    // mc15: the expert mat-vecs with 4 rows per simdgroup and, for q4_K rows of two blocks, the split-lane path;
+    // row counts not a multiple of the rows of a threadgroup
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int m : {2048, 200, 21}) {
+            for (int k : {512, 2048}) {
+                for (int n : {1, 3}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, m, n, k));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -14054,7 +14066,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              {GGML_TYPE_Q6_K, 2048, 8192},  // layer 0 ffn_down
          }) {
         test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, 2048, c.k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, 1, c.k, {1, 1}, {1, 1})); // decode
     }
+    // mc15: the expert mat-vecs of one decode token
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 2048, 2048));   // ffn_up_exps, ffn_gate_exps
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps (half the layers)

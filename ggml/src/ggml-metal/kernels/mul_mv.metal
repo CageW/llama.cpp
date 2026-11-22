@@ -1527,17 +1527,11 @@ void kernel_mul_mv_q4_K_f32_impl(
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
-#ifdef MC15_MV_Q4K_SPLIT
-    // rows of only two blocks (K = 512): the two halves of the simdgroup take nr0 rows each instead of idling
-    const bool split = args.ne00 == 2*QK_K;
-    const short ngb = split ? 2 : 4;          // lane groups per row
-    const short ix  = (tiisg/8) % ngb;
-    const short rg  = split ? tiisg/16 : 0;
-#else
-    const short ngb = 4;
-    const short ix = tiisg/8;  // 0...3
-    const short rg = 0;
-#endif
+    // FC_mul_mv_split: rows of two blocks (K = 512) - the two halves of the simdgroup take nr0 rows each instead of
+    // half of the lanes idling, so a simdgroup covers 2*nr0 rows
+    const short ngb = FC_mul_mv_split ? 2 : 4;          // lane groups per row
+    const short ix  = (tiisg/8) % ngb;                   // 0...ngb-1
+    const short rg  = FC_mul_mv_split ? tiisg/16 : 0;
     const short it = tiisg%8;  // 0...7
     const short iq = it/4;     // 0 or 1
     const short ir = it%4;     // 0...3
@@ -1569,11 +1563,10 @@ void kernel_mul_mv_q4_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    if (first_row >= args.ne0) {
-        return;
-    }
+    // a half past the last row skips the loads but stays for the reduction below
+    const int nbr = first_row < args.ne0 ? nb : 0;
 
-    for (int ib = ix; ib < nb; ib += ngb) {
+    for (int ib = ix; ib < nbr; ib += ngb) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
         for (short i = 0; i < 8; ++i) {
@@ -1627,17 +1620,17 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         float sum_all;
-        if (ngb == 4) {
-            sum_all = simd_sum(sumf[row]);
-        } else {
+        if (FC_mul_mv_split) {
             // sum over the 16 lanes of this half
             sum_all = sumf[row];
             sum_all += simd_shuffle_xor(sum_all, 1);
             sum_all += simd_shuffle_xor(sum_all, 2);
             sum_all += simd_shuffle_xor(sum_all, 4);
             sum_all += simd_shuffle_xor(sum_all, 8);
+        } else {
+            sum_all = simd_sum(sumf[row]);
         }
-        if (tiisg % 16 == 0 && (ngb == 4 ? tiisg == 0 : true)) {
+        if (tiisg % (32/(4/ngb)) == 0) {
             dst_f32[first_row + row] = sum_all;
         }
     }
@@ -3903,9 +3896,9 @@ template [[host_name("kernel_mul_mv_id_nvfp4_f32")]]   kernel kernel_mul_mv_id_t
 
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
-template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
+template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K_ID>>>;
 template [[host_name("kernel_mul_mv_id_q5_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q5_K_f32_impl   <N_R0_Q5_K>>>;
-template [[host_name("kernel_mul_mv_id_q6_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl   <N_R0_Q6_K>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl   <N_R0_Q6_K_ID>>>;
 template [[host_name("kernel_mul_mv_id_iq1_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq1_m_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_m_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq2_xxs_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
