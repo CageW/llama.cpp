@@ -3525,7 +3525,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             const size_t smem = pipeline.smem;
 
-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+            // the prepass spreads the entries over the threads of its one threadgroup
+            const int nth_map = std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
@@ -3537,7 +3538,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, nth_map, 1, 1);
         }
 
         // zero the rows that no expert owns - disjoint from what kernel_mul_mm_id writes

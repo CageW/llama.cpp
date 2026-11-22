@@ -886,6 +886,74 @@ kernel void kernel_mul_mm_id_map0(
     }
 }
 
+// mc15: the same tile map as kernel_mul_mm_id_map0, built with threadgroup atomics in two passes over the entries,
+// each thread taking every ntg-th entry, instead of one thread per expert scanning all entries; the entries of an
+// expert land in any order (each output row is computed from its own src1 row alone, so the results do not change).
+// tpe and the bases match map0; slots with id -1 (or out of range) get no entry, as in map0
+kernel void kernel_mul_mm_id_map1(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device  const char * src2,
+        device        char * htpe,
+        device        char * hids,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    threadgroup atomic_uint * cnt = (threadgroup atomic_uint *) (shmem);
+    threadgroup atomic_uint * pos = cnt + FC_mul_mm_id_map0_ne02;
+
+    for (int e = tpitg; e < FC_mul_mm_id_map0_ne02; e += ntg) {
+        atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int n = args.ne21*args.ne20;
+
+    for (int e = tpitg; e < n; e += ntg) {
+        const int32_t id = ((device const int32_t *) (src2 + (e/args.ne20)*args.nb21))[e%args.ne20];
+        if (id >= 0 && id < FC_mul_mm_id_map0_ne02) {
+            atomic_fetch_add_explicit(&cnt[id], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tpitg == 0) {
+        const uint32_t NTILE = FC_mul_mm_id_wide ? 64 : 32;
+
+        uint32_t base = 0;
+        uint32_t tile = 0;
+
+        device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+
+        for (int e = 0; e < FC_mul_mm_id_map0_ne02; ++e) {
+            const uint32_t m = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+
+            atomic_store_explicit(&pos[e], base, memory_order_relaxed);
+
+            for (uint32_t k = 0; k < m; k += NTILE) {
+                tpe_u32[1 + 3*tile    ] = e;
+                tpe_u32[1 + 3*tile + 1] = base + k;
+                tpe_u32[1 + 3*tile + 2] = m - k < NTILE ? m - k : NTILE;
+
+                tile++;
+            }
+
+            base += m + 1;
+        }
+
+        tpe_u32[0] = tile;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device int32_t * ids_i32 = (device int32_t *) (hids);
+
+    for (int e = tpitg; e < n; e += ntg) {
+        const int32_t id = ((device const int32_t *) (src2 + (e/args.ne20)*args.nb21))[e%args.ne20];
+        if (id >= 0 && id < FC_mul_mm_id_map0_ne02) {
+            ids_i32[atomic_fetch_add_explicit(&pos[id], 1u, memory_order_relaxed)] = e;
+        }
+    }
+}
+
 // kernel_mul_mm_id only writes the rows that an expert owns, so the skipped rows are zeroed here
 kernel void kernel_mul_mm_id_zero(
         constant ggml_metal_kargs_mul_mm_id_zero & args,
