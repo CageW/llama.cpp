@@ -616,6 +616,291 @@ template [[host_name("kernel_flash_attn_ext_nax_bf16_dk192_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_nax_f16_dk576_dv512")]]  kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<half,   576, 512, 4>;
 template [[host_name("kernel_flash_attn_ext_nax_bf16_dk576_dv512")]] kernel flash_attn_ext_nax_t kernel_flash_attn_ext_nax<bfloat, 576, 512, 4>;
 
+// mc15: the NAX kernel for long K/V (f16, head size 128): each K/V block is copied once to threadgroup memory with
+// 16-byte loads and shared by the NSG simdgroups (rows padded to TS halves), and the next block is read into registers
+// while the current one is used; each simdgroup takes RM tiles of 16 query rows, BQ = NSG*RM*16 queries per threadgroup
+template<short DK, short DV, short RM, short BQ = OP_FLASH_ATTN_EXT_NAX_NQPSG, short BK = OP_FLASH_ATTN_EXT_NAX_NCPSG>
+kernel void kernel_flash_attn_ext_nax_tg(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * blk,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short kU  = 16;
+    constexpr short TK  = BK/kU;
+    constexpr short TDk = DK/kU;
+    constexpr short TDv = DV/kU;
+
+    const int iq3 = tgpig[2];
+    const int iq2 = tgpig[1];
+    const int iq1 = tgpig[0]*BQ;
+
+    const short2 sc = nax_coord(tiisg);
+    const short fn = sc.x;
+    const short fm = sc.y;
+
+    int r0[RM];
+    FOR_UNROLL (short t = 0; t < RM; ++t) {
+        r0[t] = iq1 + (sgitg*RM + t)*kU + fm;
+    }
+
+    vec<half, 8> qf[RM][TDk];
+    {
+        const float qs = args.scale*M_LOG2E_F;
+        device const char * q0 = q + iq2*args.nb02 + iq3*args.nb03;
+
+        FOR_UNROLL (short t = 0; t < RM; ++t) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                const int r = r0[t] + 8*i;
+                FOR_UNROLL (short id = 0; id < TDk; ++id) {
+                    float4 x = 0.0f;
+                    if (r < args.ne01) {
+                        x = *((device const float4 *) (q0 + r*args.nb01) + (id*kU + fn)/4);
+                    }
+                    const half4 h = (half4) (x*qs);
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        qf[t][id][4*i + j] = h[j];
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        const int ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const int ikv3 = iq3/(args.ne03/args.ne_12_3);
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    const int sk = args.ns10;
+    const int sv = args.ns20;
+
+    constexpr short TS = DK + 8;
+    constexpr short NT = (BQ/(RM*16))*32;
+    const short tiitg = sgitg*32 + tiisg;
+
+    threadgroup half * sk_ = (threadgroup half *) shmem;
+    threadgroup half * sv_ = sk_ + BK*TS;
+
+    device const half * k_ = (device const half *) k;
+    device const half * v_ = (device const half *) v;
+
+    threadgroup const half * pk = sk_ + fm*TS + fn;
+    threadgroup const half * pv = sv_ + fm*TS + fn;
+
+    device const half * pm[RM][2];
+    bool row_ok[RM][2];
+    FOR_UNROLL (short t = 0; t < RM; ++t) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = r0[t] + 8*i;
+            row_ok[t][i] = r < args.ne31;
+            pm[t][i] = (device const half *) (mask + (row_ok[t][i] ? r : 0)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33) + fn;
+        }
+    }
+
+    if (FC_flash_attn_ext_nax_has_mask) {
+        const int nblk1 = (args.ne01 + BQ - 1)/BQ;
+        const int nblk0 = (args.ne11 + BK - 1)/BK;
+        blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/BQ)*nblk0;
+    }
+
+    vec<float, 8> of[RM][TDv];
+    float M[RM][2];
+    float S[RM][2];
+    FOR_UNROLL (short t = 0; t < RM; ++t) {
+        FOR_UNROLL (short id = 0; id < TDv; ++id) {
+            of[t][id] = 0.0f;
+        }
+        M[t][0] = M[t][1] = -FLT_MAX/2;
+        S[t][0] = S[t][1] = 0.0f;
+    }
+
+    const int nblk_k = args.ne11/BK;
+
+    char blk_next = 2;
+    if (FC_flash_attn_ext_nax_has_mask) {
+        blk_next = blk[0];
+    }
+
+    typedef vec<half, 8> half8_t;
+    constexpr short NE = BK*DK/8/NT;
+    half8_t kr[NE];
+    half8_t vr[NE];
+    int ic_pf = -1;
+
+    for (int ic0 = 0, ic = 0; ic < args.ne11; ++ic0, ic += BK) {
+        char blk_cur = blk_next;
+
+        if (FC_flash_attn_ext_nax_has_mask) {
+            blk_next = ic0 + 1 < nblk_k ? blk[ic0 + 1] : 2;
+            if (blk_cur == 0) {
+                continue;
+            }
+        }
+
+        // registers hold the next block (loaded at the end of the previous iteration); store, then prefetch the following
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ic != ic_pf) {
+            FOR_UNROLL (short e = 0; e < NE; ++e) {
+                const short ee = tiitg + e*NT;
+                const short r = ee/(DK/8);
+                const short c = (ee%(DK/8))*8;
+                kr[e] = *((device const half8_t *) (k_ + (ic + r)*sk + c));
+                vr[e] = *((device const half8_t *) (v_ + (ic + r)*sv + c));
+            }
+        }
+        FOR_UNROLL (short e = 0; e < NE; ++e) {
+            const short ee = tiitg + e*NT;
+            const short r = ee/(DK/8);
+            const short c = (ee%(DK/8))*8;
+            *((threadgroup half8_t *) (sk_ + r*TS + c)) = kr[e];
+            *((threadgroup half8_t *) (sv_ + r*TS + c)) = vr[e];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const int icn = ic + BK;
+            ic_pf = icn;
+            if (icn < args.ne11) {
+                FOR_UNROLL (short e = 0; e < NE; ++e) {
+                    const short ee = tiitg + e*NT;
+                    const short r = ee/(DK/8);
+                    const short c = (ee%(DK/8))*8;
+                    kr[e] = *((device const half8_t *) (k_ + (icn + r)*sk + c));
+                    vr[e] = *((device const half8_t *) (v_ + (icn + r)*sv + c));
+                }
+            }
+        }
+
+        vec<float, 8> sf[RM][TK];
+        FOR_UNROLL (short t = 0; t < RM; ++t) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                sf[t][ik] = 0.0f;
+            }
+        }
+
+        // S = Q*K^T: each K fragment pair is loaded once and used by the RM row tiles
+        FOR_UNROLL (short ik = 0; ik < TK; ik += 2) {
+            FOR_UNROLL (short id = 0; id < TDk; ++id) {
+                vec<half, 8> k0;
+                vec<half, 8> k1;
+
+                threadgroup const half * pk0 = pk + (ik*kU)*TS + id*kU;
+                threadgroup const half * pk1 = pk0 + kU*TS;
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 a = *((threadgroup const half4 *) (pk0 + 8*i*TS));
+                    const half4 b = *((threadgroup const half4 *) (pk1 + 8*i*TS));
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        k0[4*i + j] = a[j];
+                        k1[4*i + j] = b[j];
+                    }
+                }
+
+                FOR_UNROLL (short t = 0; t < RM; ++t) {
+                    nax_mma<float, half, half, true>(sf[t][ik], sf[t][ik + 1], qf[t][id], k0, k1);
+                }
+            }
+        }
+
+        if (FC_flash_attn_ext_nax_has_mask && blk_cur != 2) {
+            FOR_UNROLL (short t = 0; t < RM; ++t) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    if (row_ok[t][i]) {
+                        FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                            device const half * pmi = pm[t][i] + ic + ik*kU;
+                            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                                sf[t][ik][4*i + j] += M_LOG2E_F*(float) pmi[j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short t = 0; t < RM; ++t) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                float m = M[t][i];
+                FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                    m = max(m, max(max(sf[t][ik][4*i + 0], sf[t][ik][4*i + 1]), max(sf[t][ik][4*i + 2], sf[t][ik][4*i + 3])));
+                }
+                m = max(m, simd_shuffle_xor(m, 1));
+                m = max(m, simd_shuffle_xor(m, 8));
+
+                const float ms = fast::exp2(M[t][i] - m);
+                M[t][i] = m;
+
+                float sum = 0.0f;
+                FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        const float p = fast::exp2(sf[t][ik][4*i + j] - m);
+                        sf[t][ik][4*i + j] = p;
+                        sum += p;
+                    }
+                }
+                sum += simd_shuffle_xor(sum, 1);
+                sum += simd_shuffle_xor(sum, 8);
+
+                S[t][i] = S[t][i]*ms + sum;
+
+                FOR_UNROLL (short id = 0; id < TDv; ++id) {
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        of[t][id][4*i + j] *= ms;
+                    }
+                }
+            }
+        }
+
+        // O += P*V: each V fragment pair is loaded once and used by the RM row tiles
+        FOR_UNROLL (short id = 0; id < TDv; id += 2) {
+            FOR_UNROLL (short ik = 0; ik < TK; ++ik) {
+                vec<half, 8> v0;
+                vec<half, 8> v1;
+
+                threadgroup const half * pv0 = pv + (ik*kU)*TS + id*kU;
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 a = *((threadgroup const half4 *) (pv0 + 8*i*TS));
+                    const half4 b = *((threadgroup const half4 *) (pv0 + 8*i*TS + kU));
+                    FOR_UNROLL (short j = 0; j < 4; ++j) {
+                        v0[4*i + j] = a[j];
+                        v1[4*i + j] = b[j];
+                    }
+                }
+
+                FOR_UNROLL (short t = 0; t < RM; ++t) {
+                    nax_mma<float, float, half, false>(of[t][id], of[t][id + 1], sf[t][ik], v0, v1);
+                }
+            }
+        }
+    }
+
+    device float * pdst = (device float *) dst + ((uint64_t) iq3*args.ne2*args.ne1 + iq2)*DV + fn;
+
+    FOR_UNROLL (short t = 0; t < RM; ++t) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = r0[t] + 8*i;
+            if (r < args.ne01) {
+                const float rs = S[t][i] == 0.0f ? 0.0f : 1.0f/S[t][i];
+                device float * pd = pdst + (uint64_t) r*args.ne1*DV;
+                FOR_UNROLL (short id = 0; id < TDv; ++id) {
+                    *((device float4 *) (pd + id*kU)) = float4(of[t][id][4*i + 0], of[t][id][4*i + 1], of[t][id][4*i + 2], of[t][id][4*i + 3])*rs;
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_flash_attn_ext_nax_tg<128, 128, 1>) flash_attn_ext_nax_tg_t;
+
+template [[host_name("kernel_flash_attn_ext_nax_tg_f16_dk128_dv128")]] kernel flash_attn_ext_nax_tg_t kernel_flash_attn_ext_nax_tg<128, 128, 1, 128>;
+
 // small batches: the queries of the G heads that share a KV head are packed into rows p = g*ne01 + i, so each K/V block is loaded once
 // the KV range is split over NWG threadgroups, combined by kernel_flash_attn_ext_vec_reduce; no ALiBi or softcap
 template<

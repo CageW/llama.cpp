@@ -148,6 +148,7 @@
 
 // register-resident NAX kernel: 16 queries per row group, head dim split across WN simdgroups
 #define OP_FLASH_ATTN_EXT_NAX_NQPSG 64
+#define OP_FLASH_ATTN_EXT_NAX_TG_NQPTG 128 // mc15: queries per threadgroup of the NAX tg kernel (16 per simdgroup)
 #define OP_FLASH_ATTN_EXT_NAX_NCPSG 32
 
 // register-resident NAX mat-mat for f16 operands: BM src1 rows x BN src0 rows per threadgroup, WM x WN simdgroups

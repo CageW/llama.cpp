@@ -13597,6 +13597,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // mc15: the NAX tg attention kernel (f16 K/V, head size 128, from 4096 K/V and 128 queries): with and without a
+    // mask, a causal prefill mask, query counts not a multiple of 128
+    for (int kv : {4096, 8192}) {
+        for (int nb : {128, 200, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, nb, true,  false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, nb, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext_prefill_mask(128, 128, 2, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
