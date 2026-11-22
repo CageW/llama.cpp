@@ -1996,6 +1996,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_t
     return res;
 }
 
+// mc15: one tile of 16 rows over an f16 cache with head size 128 (decode) gets two simdgroups of 64 columns each, so
+// twice as many K/V loads are in flight per threadgroup; the other kernels take one simdgroup per 128 columns
+int ggml_metal_flash_attn_ext_nax_gqa_wn(const ggml_tensor * op, int wm) {
+    const int64_t dk = op->src[1]->ne[0];
+
+    if (dk == 128 && wm == 1 && op->src[1]->type == GGML_TYPE_F16) {
+        return 2;
+    }
+
+    return std::max(1, (int) (dk/128));
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_nax(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
@@ -2015,6 +2027,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     // wm > 0: the GQA variant with wm tiles of 16 query rows
     if (wm > 0) {
         snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_%s_dk%d_dv%d_wm%d", kv, dk, dv, wm);
+        if (dk == 128 && ggml_metal_flash_attn_ext_nax_gqa_wn(op, wm) == 2) {
+            snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_%s_dk%d_dv%d_wm%d_wn2", kv, dk, dv, wm);
+        }
     } else {
         snprintf(base, 256, "kernel_flash_attn_ext_nax_%s_dk%d_dv%d", kv, dk, dv);
     }

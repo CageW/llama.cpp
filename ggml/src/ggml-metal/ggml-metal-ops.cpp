@@ -4512,7 +4512,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     if (gqa_wm > 0) {
         // KV splits: the partial results go to the temp buffer of the vec kernels, sized for 32 splits of up to 32 queries per head
         const int nwg = std::min<int64_t>(32, 1024/ne01);
-        const int nwn = std::max(1, (int) (ne00/128));
+        const int nwn = ggml_metal_flash_attn_ext_nax_gqa_wn(op, gqa_wm);
         const int nsg = gqa_wm*nwn;
 
         GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);

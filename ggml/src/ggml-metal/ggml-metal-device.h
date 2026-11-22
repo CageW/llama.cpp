@@ -218,6 +218,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool has_mask,
         int  wm);
 
+// simdgroups that split the head size in the GQA NAX kernel with wm row tiles
+int ggml_metal_flash_attn_ext_nax_gqa_wn(const struct ggml_tensor * op, int wm);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
