@@ -887,6 +887,73 @@ kernel void kernel_mul_mm_id_map0(
 }
 
 // kernel_mul_mm_id only writes the rows that an expert owns, so the skipped rows are zeroed here
+// mc15: the same tile map as kernel_mul_mm_id_map0, built with threadgroup atomics in two passes over the entries,
+// each thread taking every ntg-th entry; the entries of an expert land in any order (each output row is computed
+// from its own src1 row, so the order does not change the results). tpe and the bases match map0.
+kernel void kernel_mul_mm_id_map1(
+        constant ggml_metal_kargs_mul_mm_id_map0 & args,
+        device  const char * src2,
+        device        char * htpe,
+        device        char * hids,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    threadgroup atomic_uint * cnt = (threadgroup atomic_uint *) (shmem);
+    threadgroup atomic_uint * pos = cnt + FC_mul_mm_id_map0_ne02;
+
+    for (int e = tpitg; e < FC_mul_mm_id_map0_ne02; e += ntg) {
+        atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int n = args.ne21*args.ne20;
+
+    for (int e = tpitg; e < n; e += ntg) {
+        const int32_t id = ((device const int32_t *) (src2 + (e/args.ne20)*args.nb21))[e%args.ne20];
+        if (id >= 0) {
+            atomic_fetch_add_explicit(&cnt[id], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tpitg == 0) {
+        const uint32_t NTILE = FC_mul_mm_id_wide ? 64 : 32;
+
+        uint32_t base = 0;
+        uint32_t tile = 0;
+
+        device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+
+        for (int e = 0; e < FC_mul_mm_id_map0_ne02; ++e) {
+            const uint32_t m = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+
+            atomic_store_explicit(&pos[e], base, memory_order_relaxed);
+
+            for (uint32_t k = 0; k < m; k += NTILE) {
+                tpe_u32[1 + 3*tile    ] = e;
+                tpe_u32[1 + 3*tile + 1] = base + k;
+                tpe_u32[1 + 3*tile + 2] = m - k < NTILE ? m - k : NTILE;
+
+                tile++;
+            }
+
+            base += m + 1;
+        }
+
+        tpe_u32[0] = tile;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device int32_t * ids_i32 = (device int32_t *) (hids);
+
+    for (int e = tpitg; e < n; e += ntg) {
+        const int32_t id = ((device const int32_t *) (src2 + (e/args.ne20)*args.nb21))[e%args.ne20];
+        if (id >= 0) {
+            ids_i32[atomic_fetch_add_explicit(&pos[id], 1u, memory_order_relaxed)] = e;
+        }
+    }
+}
+
 kernel void kernel_mul_mm_id_zero(
         constant ggml_metal_kargs_mul_mm_id_zero & args,
         device const char * src2,
@@ -1641,4 +1708,167 @@ MV_NAX_INSTANCE(bf16,    bfloat4x4,     1,     dequantize_bf16)
 #endif
 NAX_QTYPES(MV_NAX_INSTANCE)
 MV_NAX_INSTANCE(q5_K,    block_q5_K,    QK_NL, dequantize_q5_K_nax)
+
+// mc15: MUL_MAT_ID mat-mat on the NAX units with the weights dequantized in registers (as kernel_mul_mv_nax_f32)
+// grid: x = entry tile of the prepass (up to 16*MR entries of one expert), y = block of 32*NSG weight rows
+// each simdgroup: 32 weight rows x the 16*MR entries of the tile, over the whole K; no threadgroup memory
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short MR>
+kernel void kernel_mul_mm_id_nax(
+        constant ggml_metal_kargs_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const short NSG = ntg.y;
+
+    device const uint32_t * tpe = (device const uint32_t *) htpe;
+    device const int32_t  * ids = (device const int32_t  *) hids;
+
+    const int tile = tgpig.x;
+    if (tile >= (int) tpe[0]) {
+        return;
+    }
+
+    const int im  = tpe[1 + 3*tile];
+    const int idb = tpe[1 + 3*tile + 1];
+    const int nr1 = min((int) tpe[1 + 3*tile + 2], 16*MR);
+
+    const int i01 = (tgpig.y*NSG + sgitg)*32;
+    if (i01 >= args.ne0) {
+        return;
+    }
+
+    const short2 lc = nax_coord(tiisg);
+    const short fn = lc.x;
+    const short fm = lc.y;
+
+    device const block_q * x[2][2];
+    FOR_UNROLL (short h = 0; h < 2; ++h) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int r = min(i01 + 16*h + fm + 8*i, args.ne0 - 1);
+            x[h][i] = (device const block_q *) (src0 + im*args.nb02 + (uint64_t) r*args.nb01);
+        }
+    }
+
+    // the src1 rows of the entries of this lane (row 0 of the tile past nr1, never stored)
+    device const float * y[MR][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int j  = 16*m + fm + 8*i;
+            const int id = ids[idb + (j < nr1 ? j : 0)];
+            const int ide = id % args.ne20;
+            const int idt = id / args.ne20;
+            y[m][i] = (device const float *) (src1 + (uint64_t) idt*args.nb12 + (uint64_t) (ide % args.ne11)*args.nb11);
+        }
+    }
+
+    vec<float, 8> c[MR][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        c[m][0] = 0.0f;
+        c[m][1] = 0.0f;
+    }
+#ifdef MC15_MMID_ACC2
+    // a second accumulator set for the odd K fragments: two independent chains per tile
+    vec<float, 8> c2[MR][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        c2[m][0] = 0.0f;
+        c2[m][1] = 0.0f;
+    }
+#endif
+
+    const int nch = args.ne00/64;
+
+    for (int ch = 0; ch < nch; ++ch) {
+        const int p = 64*ch + 4*fn;
+        const int ib = p/(16*nl);
+        const short il = (p/16)%nl;
+
+        vec<half, 8> b[4][2];
+        FOR_UNROLL (short h = 0; h < 2; ++h) {
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                half4x4 w;
+#ifdef MC15_MMID_ABL_NOB
+                w = half4x4((half) ch);
+#else
+                deq(x[h][i] + ib, il, w);
+#endif
+                FOR_UNROLL (short s = 0; s < 4; ++s) {
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        b[s][h][4*i + jj] = w[s][jj];
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short m = 0; m < MR; ++m) {
+            vec<half, 8> a[4];
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+#ifdef MC15_MMID_ABL_NOA
+                    const float4 v = float4((float) ch, (float) s, (float) m, 1.0f);
+#else
+                    const float4 v = *((device const float4 *) (y[m][i] + p + 4*s));
+#endif
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        a[s][4*i + jj] = (half) v[jj];
+                    }
+                }
+            }
+#ifdef MC15_MMID_ACC2
+            FOR_UNROLL (short s = 0; s < 4; s += 2) {
+                nax_mma<float, half, half, true>(c [m][0], c [m][1], a[s],     b[s][0],     b[s][1]);
+                nax_mma<float, half, half, true>(c2[m][0], c2[m][1], a[s + 1], b[s + 1][0], b[s + 1][1]);
+            }
+#else
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                nax_mma<float, half, half, true>(c[m][0], c[m][1], a[s], b[s][0], b[s][1]);
+            }
+#endif
+        }
+    }
+
+#ifdef MC15_MMID_ACC2
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        c[m][0] += c2[m][0];
+        c[m][1] += c2[m][1];
+    }
+#endif
+
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int j = 16*m + fm + 8*i;
+            if (j >= nr1) {
+                continue;
+            }
+            const int id  = ids[idb + j];
+            const int ide = id % args.ne20;
+            const int idt = id / args.ne20;
+            device float * d = (device float *) dst + (uint64_t) ide*args.ne0 + (uint64_t) idt*args.ne1*args.ne0;
+            FOR_UNROLL (short h = 0; h < 2; ++h) {
+                const int r0 = i01 + 16*h + fn;
+                if (r0 + 3 < args.ne0) {
+                    *((device float4 *) (d + r0)) = float4(c[m][h][4*i + 0], c[m][h][4*i + 1], c[m][h][4*i + 2], c[m][h][4*i + 3]);
+                } else {
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        if (r0 + jj < args.ne0) {
+                            d[r0 + jj] = c[m][h][4*i + jj];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_nax<block_q4_K, QK_NL, dequantize_q4_K, 4>) mul_mm_id_nax_t;
+
+template [[host_name("kernel_mul_mm_id_nax_q4_K_mr4")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q4_K, QK_NL, dequantize_q4_K, 4>;
+template [[host_name("kernel_mul_mm_id_nax_q6_K_mr4")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q6_K, QK_NL, dequantize_q6_K, 4>;
+template [[host_name("kernel_mul_mm_id_nax_q4_K_mr2")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q4_K, QK_NL, dequantize_q4_K, 2>;
+template [[host_name("kernel_mul_mm_id_nax_q6_K_mr2")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q6_K, QK_NL, dequantize_q6_K, 2>;
 #endif // GGML_METAL_HAS_TENSOR

@@ -1320,7 +1320,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+    // mc15: GGML_METAL_MMID_MAP1 uses the atomic two-pass prepass (any ne20)
+    static const bool map1 = getenv("GGML_METAL_MMID_MAP1") != nullptr;
+
+    if (map1) {
+        snprintf(base, 256, "kernel_mul_mm_id_map1");
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_id_map0_ne20_%d", ne20);
+    }
     snprintf(name, 256, "%s_ne02=%d_wide=%d", base, ne02, wide);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1335,7 +1342,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
     }
 
     // per expert: entry count + base offset, followed by the staging of the ids of ntg tokens
-    res.smem = 2*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*ne20*sizeof(uint16_t);
+    res.smem = 2*(size_t) ne02*sizeof(uint32_t) + (map1 ? 0 : (size_t) ne02*ne20*sizeof(uint16_t));
     res.smem = GGML_PAD(res.smem, 16);
 
     return res;

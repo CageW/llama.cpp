@@ -3517,7 +3517,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_ids = bid_tpe;
         bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
 
-        const bool wide = props_dev->has_tensor && ggml_metal_op_mul_mat_id_wide(op);
+        // mc15: GGML_METAL_MMID_NAX = 2 or 4 runs the expert mat-mat on the NAX units (q4_K/q6_K weights, f32 src1), 16*mr entries per tile
+        static const int mmid_nax_env = getenv("GGML_METAL_MMID_NAX") ? atoi(getenv("GGML_METAL_MMID_NAX")) : 0;
+        const int mmid_nax = props_dev->has_nax && (mmid_nax_env == 2 || mmid_nax_env == 4) &&
+            (op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q6_K) &&
+            op->src[1]->type == GGML_TYPE_F32 && ne00 % 64 == 0 ? mmid_nax_env : 0;
+
+        const bool wide = mmid_nax ? mmid_nax == 4 : props_dev->has_tensor && ggml_metal_op_mul_mat_id_wide(op);
 
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
@@ -3534,6 +3540,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             const size_t smem = pipeline.smem;
 
+            const int nth_map = getenv("GGML_METAL_MMID_MAP1") ? std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) : ne02;
+
             GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -3546,7 +3554,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, nth_map, 1, 1);
         }
 
         // zero the rows that no expert owns - disjoint from what kernel_mul_mm_id writes
@@ -3565,12 +3573,54 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_dst,  2);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, ne20, ne21, 1, 32, 1, 1);
+            if (!getenv("GGML_METAL_MMID_SKIPZ")) {
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne20, ne21, 1, 32, 1, 1);
+            }
         }
 
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
         ggml_metal_op_concurrency_reset(ctx);
 
+        if (mmid_nax) {
+            char name[64];
+            snprintf(name, sizeof(name), "kernel_mul_mm_id_nax_%s_mr%d", ggml_type_name(op->src[0]->type), mmid_nax);
+
+            auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+            ggml_metal_kargs_mul_mm_id args = {
+                /*.ne00  =*/ ne00,
+                /*.ne02  =*/ ne02,
+                /*.nb01  =*/ nb01,
+                /*.nb02  =*/ nb02,
+                /*.nb03  =*/ nb03,
+                /*.ne11  =*/ ne11,
+                /*.nb10  =*/ nb10,
+                /*.nb11  =*/ nb11,
+                /*.nb12  =*/ nb12,
+                /*.nb13  =*/ nb13,
+                /*.ne20  =*/ ne20,
+                /*.ne0   =*/ ne0,
+                /*.ne1   =*/ ne1,
+                /*.r2    =*/ r2,
+                /*.r3    =*/ r3,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+
+            static const int nsg = getenv("GGML_METAL_MMID_NSG") ? atoi(getenv("GGML_METAL_MMID_NSG")) : 4;
+            const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
+
+            // experiment: GGML_METAL_MMID_SKIP leaves only the prepass (map0 + zero)
+            if (!getenv("GGML_METAL_MMID_SKIP")) {
+                ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne0 + 32*nsg - 1)/(32*nsg), 1, 32, nsg, 1);
+            }
+        } else
         {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op, wide);
 
