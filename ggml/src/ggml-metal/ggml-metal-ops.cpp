@@ -4575,14 +4575,25 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const bool use_nax = props_dev->has_nax && ggml_metal_op_flash_attn_ext_use_nax(op);
 
         // queries per threadgroup
-        const int nqptg = use_nax ? OP_FLASH_ATTN_EXT_NAX_NQPSG :
+        const int fa_rm_q = getenv("GGML_METAL_FA_RM") ? atoi(getenv("GGML_METAL_FA_RM")) : 1;
+        const int nqptg = (fa_rm_q < 0 && use_nax && ne00 == 128 && ne20 == 128 && op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16) ? -64*fa_rm_q :
+                          use_nax ? OP_FLASH_ATTN_EXT_NAX_NQPSG :
                           ne00 >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG;
         // cache values per threadgroup
         const int ncpsg = use_nax ? OP_FLASH_ATTN_EXT_NAX_NCPSG : OP_FLASH_ATTN_EXT_TENSOR_NCPSG;
 
         // the NAX kernel splits the head dim across nwn simdgroups, with 4 groups of 16 queries
         const int nwn = use_nax ? std::max(1, (int) (ne00/128)) : 0;
-        const int nsg = use_nax ? 4*nwn : OP_FLASH_ATTN_EXT_TENSOR_NSG; // number of simdgroups
+
+        // mc15: rm row tiles of 16 queries per simdgroup (f16 K/V, head size 128), GGML_METAL_FA_RM = 2 or 4
+        static const int fa_rm = getenv("GGML_METAL_FA_RM") ? atoi(getenv("GGML_METAL_FA_RM")) : 1;
+        const int rm = use_nax && nwn == 1 && (fa_rm == 2 || fa_rm == 4) && ne00 == 128 && ne20 == 128 &&
+                       op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 ? fa_rm : 1;
+        // GGML_METAL_FA_RM=-1: the threadgroup-staged kernel (one row tile per simdgroup)
+        const int rm_tg = use_nax && nwn == 1 && (fa_rm == -1 || fa_rm == -2 || fa_rm == -4) && ne00 == 128 && ne20 == 128 &&
+                       op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
+
+        const int nsg = rm_tg ? -4*fa_rm : use_nax ? 4*nwn/rm : OP_FLASH_ATTN_EXT_TENSOR_NSG; // number of simdgroups
 
         if (has_mask) {
             assert(ggml_metal_op_flash_attn_ext_extra_blk(op) != 0);
@@ -4615,11 +4626,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         // shared memory layout: queries (16-bit), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
         // NAX: the partial scores of every simdgroup, one float per lane and fragment element
-        const size_t smem = use_nax ? (size_t) nsg*(ncpsg/16)*8*32*sizeof(float) :
+        const size_t smem = rm_tg ? (size_t) 2*ncpsg*(ne00 + 8)*sizeof(ggml_fp16_t) :
+            use_nax ? (size_t) nsg*(ncpsg/16)*8*32*sizeof(float) :
             GGML_PAD(nqptg*ne00*sizeof(ggml_fp16_t) + nqptg*ncpsg*(sizeof(float) + sizeof(ggml_fp16_t)) +
                      nqptg*sizeof(float) + sizeof(int32_t), 16);
 
-        auto pipeline = use_nax ?
+        auto pipeline = rm_tg ? ggml_metal_library_get_pipeline_flash_attn_ext_nax_rm(lib, op, has_mask, fa_rm) :
+            rm > 1 ? ggml_metal_library_get_pipeline_flash_attn_ext_nax_rm(lib, op, has_mask, rm) :
+            use_nax ?
             ggml_metal_library_get_pipeline_flash_attn_ext_nax(lib, op, has_mask, 0) :
             ggml_metal_library_get_pipeline_flash_attn_ext_tensor(lib, op, has_mask, has_sinks, has_bias, has_scap);
 
