@@ -1,3 +1,4 @@
+#include <string>
 #include "ggml-metal-ops.h"
 
 #include "ggml.h"
@@ -226,6 +227,31 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return 1;
+    }
+
+    // mc15 timing attribution only: GGML_METAL_SKIP_NAMES="a,b" skips the nodes (with their fusion group) whose name
+    // contains one of the substrings - the results are wrong, only the time of the rest is meaningful
+    {
+        static const char * skip = getenv("GGML_METAL_SKIP_NAMES");
+        if (skip) {
+            std::string list(skip);
+            size_t b = 0;
+            while (b <= list.size()) {
+                size_t e = list.find(',', b);
+                if (e == std::string::npos) {
+                    e = list.size();
+                }
+                const std::string tok = list.substr(b, e - b);
+                if (!tok.empty() && strstr(node->name, tok.c_str()) != nullptr) {
+                    int n_skip = 1;
+                    if (ctx->use_fusion()) {
+                        ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_skip);
+                    }
+                    return std::max(1, n_skip);
+                }
+                b = e + 1;
+            }
+        }
     }
 
     int n_fuse = 1;
@@ -3450,6 +3476,16 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*(ne20*ne21 + ne02);
 }
 
+size_t ggml_metal_op_mul_mat_id_extra_act(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    if (getenv("GGML_METAL_MMID_NAX") == nullptr || atoi(getenv("GGML_METAL_MMID_NAX")) < 10) {
+        return 0;
+    }
+
+    return GGML_PAD(ggml_nelements(op->src[1])*sizeof(ggml_fp16_t), 16);
+}
+
 // tiles of 64 entries for the tensor mul_mm_id kernel, so that the weights of an expert are dequantized half as often
 // they pay off from 32 entries per expert on average
 static bool ggml_metal_op_mul_mat_id_wide(const ggml_tensor * op) {
@@ -3519,11 +3555,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         // mc15: GGML_METAL_MMID_NAX = 2 or 4 runs the expert mat-mat on the NAX units (q4_K/q6_K weights, f32 src1), 16*mr entries per tile
         static const int mmid_nax_env = getenv("GGML_METAL_MMID_NAX") ? atoi(getenv("GGML_METAL_MMID_NAX")) : 0;
-        const int mmid_nax = props_dev->has_nax && (mmid_nax_env == 2 || mmid_nax_env == 4) &&
+        const int mmid_nax = props_dev->has_nax && (mmid_nax_env == 2 || mmid_nax_env == 4 || mmid_nax_env == 11 || mmid_nax_env == 12) &&
             (op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q6_K) &&
             op->src[1]->type == GGML_TYPE_F32 && ne00 % 64 == 0 ? mmid_nax_env : 0;
 
-        const bool wide = mmid_nax ? mmid_nax == 4 : props_dev->has_tensor && ggml_metal_op_mul_mat_id_wide(op);
+        const bool wide = mmid_nax ? mmid_nax != 2 : props_dev->has_tensor && ggml_metal_op_mul_mat_id_wide(op);
 
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
@@ -3581,7 +3617,52 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
         ggml_metal_op_concurrency_reset(ctx);
 
-        if (mmid_nax) {
+        if (mmid_nax >= 10) {
+            // f16 copy of src1, then the threadgroup-dequant kernel
+            ggml_metal_buffer_id bid_act = bid_ids;
+            bid_act.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+
+            ggml_metal_kargs_mul_mm_cvt args_cvt = {
+                /*.ne10 =*/ ne10,
+                /*.ne11 =*/ ne11,
+                /*.ne12 =*/ ne12,
+                /*.nb11 =*/ nb11,
+                /*.nb12 =*/ nb12,
+                /*.nb13 =*/ nb13,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_by_name(lib, "kernel_mul_mm_cvt_f32_f16"));
+            ggml_metal_encoder_set_bytes   (enc, &args_cvt, sizeof(args_cvt), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_act,  2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne11, ne12, ne13, std::max(1, std::min(256, ne10/4)), 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            const int nb = mmid_nax - 10;
+
+            char name[64];
+            snprintf(name, sizeof(name), "kernel_mul_mm_id_nax2_%s_nb%d", ggml_type_name(op->src[0]->type), nb);
+
+            auto pipeline = ggml_metal_library_get_pipeline_by_name(lib, name);
+
+            ggml_metal_kargs_mul_mm_id args = {
+                ne00, ne02, nb01, nb02, nb03, ne11, nb10, nb11, nb12, nb13, ne20, ne0, ne1, r2, r3,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_act,  2);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, (size_t) nb*4*2*32*8*sizeof(ggml_fp16_t), 0);
+
+            const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne0 + 32*nb - 1)/(32*nb), 1, 32, 2, 1);
+        } else if (mmid_nax) {
             char name[64];
             snprintf(name, sizeof(name), "kernel_mul_mm_id_nax_%s_mr%d", ggml_type_name(op->src[0]->type), mmid_nax);
 

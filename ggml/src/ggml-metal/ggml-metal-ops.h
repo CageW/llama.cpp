@@ -52,6 +52,9 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 
+// mc15: f16 copy of src1 for the NAX expert kernel (GGML_METAL_MMID_NAX), 0 otherwise
+size_t ggml_metal_op_mul_mat_id_extra_act(const struct ggml_tensor * op);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 

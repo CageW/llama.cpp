@@ -1871,4 +1871,157 @@ template [[host_name("kernel_mul_mm_id_nax_q4_K_mr4")]] kernel mul_mm_id_nax_t k
 template [[host_name("kernel_mul_mm_id_nax_q6_K_mr4")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q6_K, QK_NL, dequantize_q6_K, 4>;
 template [[host_name("kernel_mul_mm_id_nax_q4_K_mr2")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q4_K, QK_NL, dequantize_q4_K, 2>;
 template [[host_name("kernel_mul_mm_id_nax_q6_K_mr2")]] kernel mul_mm_id_nax_t kernel_mul_mm_id_nax<block_q6_K, QK_NL, dequantize_q6_K, 2>;
+
+// mc15: MUL_MAT_ID on the NAX units, 2 simdgroups per threadgroup, each taking 32 of the 64 entries of a tile,
+// both over the same 32*NB weight rows: the weights of a 64-wide K chunk are dequantized once per threadgroup into
+// threadgroup memory, already in the per-lane fragment layout ([nb][s][h][lane][8]); src1 is an f16 copy
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &), short NB>
+kernel void kernel_mul_mm_id_nax2(
+        constant ggml_metal_kargs_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short MR  = 2;
+    constexpr short NSG = 2;
+
+    device const uint32_t * tpe = (device const uint32_t *) htpe;
+    device const int32_t  * ids = (device const int32_t  *) hids;
+
+    const int tile = tgpig.x;
+    if (tile >= (int) tpe[0]) {
+        return;
+    }
+
+    const int im  = tpe[1 + 3*tile];
+    const int idb = tpe[1 + 3*tile + 1];
+    const int nr1 = min((int) tpe[1 + 3*tile + 2], 16*MR*NSG);
+
+    const int i01 = tgpig.y*32*NB;
+
+    threadgroup half * sb = (threadgroup half *) shmem; // [NB][4][2][32][8]
+
+    // the dequantization work of this thread: virtual lane vl, fragment pair h, row half i, weight block nb
+    // NB*2*2*32 calls per chunk over 64 threads
+    constexpr short NDQ = NB*2*2*32/(32*NSG);
+    device const block_q * xq[NDQ];
+    short dq_fn[NDQ];
+    short dq_off[NDQ];
+    FOR_UNROLL (short d = 0; d < NDQ; ++d) {
+        const short w  = tiitg + d*32*NSG;
+        const short vl = w%32;
+        const short h  = (w/32)%2;
+        const short i  = (w/64)%2;
+        const short nb = w/128;
+        const short2 vc = nax_coord(vl);
+        const int r = min(i01 + 32*nb + 16*h + vc.y + 8*i, args.ne0 - 1);
+        xq[d] = (device const block_q *) (src0 + im*args.nb02 + (uint64_t) r*args.nb01);
+        dq_fn[d] = vc.x;
+        dq_off[d] = ((nb*4*2 + h)*32 + vl)*8 + 4*i; // + s*2*32*8
+    }
+
+    const short2 lc = nax_coord(tiisg);
+    const short fn = lc.x;
+    const short fm = lc.y;
+
+    device const half * y[MR][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int j  = 32*sgitg + 16*m + fm + 8*i;
+            const int id = ids[idb + (j < nr1 ? j : 0)];
+            const int ide = id % args.ne20;
+            const int idt = id / args.ne20;
+            y[m][i] = (device const half *) src1 + ((uint64_t) idt*args.ne11 + (ide % args.ne11))*args.ne00;
+        }
+    }
+
+    vec<float, 8> c[MR][NB][2];
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short nb = 0; nb < NB; ++nb) {
+            c[m][nb][0] = 0.0f;
+            c[m][nb][1] = 0.0f;
+        }
+    }
+
+    const int nch = args.ne00/64;
+
+    for (int ch = 0; ch < nch; ++ch) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short d = 0; d < NDQ; ++d) {
+            const int p = 64*ch + 4*dq_fn[d];
+            half4x4 w;
+            deq(xq[d] + p/(16*nl), (p/16)%nl, w);
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                *((threadgroup half4 *) (sb + dq_off[d] + s*2*32*8)) = w[s];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int p = 64*ch + 4*fn;
+
+        vec<half, 8> a[MR][4];
+        FOR_UNROLL (short m = 0; m < MR; ++m) {
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    const half4 v = *((device const half4 *) (y[m][i] + p + 4*s));
+                    FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                        a[m][s][4*i + jj] = v[jj];
+                    }
+                }
+            }
+        }
+
+        FOR_UNROLL (short nb = 0; nb < NB; ++nb) {
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                const vec<half, 8> b0 = *((threadgroup const vec<half, 8> *) (sb + (((nb*4 + s)*2 + 0)*32 + tiisg)*8));
+                const vec<half, 8> b1 = *((threadgroup const vec<half, 8> *) (sb + (((nb*4 + s)*2 + 1)*32 + tiisg)*8));
+                FOR_UNROLL (short m = 0; m < MR; ++m) {
+                    nax_mma<float, half, half, true>(c[m][nb][0], c[m][nb][1], a[m][s], b0, b1);
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short m = 0; m < MR; ++m) {
+        FOR_UNROLL (short i = 0; i < 2; ++i) {
+            const int j = 32*sgitg + 16*m + fm + 8*i;
+            if (j >= nr1) {
+                continue;
+            }
+            const int id  = ids[idb + j];
+            const int ide = id % args.ne20;
+            const int idt = id / args.ne20;
+            device float * d = (device float *) dst + (uint64_t) ide*args.ne0 + (uint64_t) idt*args.ne1*args.ne0;
+            FOR_UNROLL (short nb = 0; nb < NB; ++nb) {
+                FOR_UNROLL (short h = 0; h < 2; ++h) {
+                    const int r0 = i01 + 32*nb + 16*h + fn;
+                    if (r0 + 3 < args.ne0) {
+                        *((device float4 *) (d + r0)) = float4(c[m][nb][h][4*i + 0], c[m][nb][h][4*i + 1], c[m][nb][h][4*i + 2], c[m][nb][h][4*i + 3]);
+                    } else {
+                        FOR_UNROLL (short jj = 0; jj < 4; ++jj) {
+                            if (r0 + jj < args.ne0) {
+                                d[r0 + jj] = c[m][nb][h][4*i + jj];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_nax2<block_q4_K, QK_NL, dequantize_q4_K, 1>) mul_mm_id_nax2_t;
+
+template [[host_name("kernel_mul_mm_id_nax2_q4_K_nb1")]] kernel mul_mm_id_nax2_t kernel_mul_mm_id_nax2<block_q4_K, QK_NL, dequantize_q4_K, 1>;
+template [[host_name("kernel_mul_mm_id_nax2_q6_K_nb1")]] kernel mul_mm_id_nax2_t kernel_mul_mm_id_nax2<block_q6_K, QK_NL, dequantize_q6_K, 1>;
+template [[host_name("kernel_mul_mm_id_nax2_q4_K_nb2")]] kernel mul_mm_id_nax2_t kernel_mul_mm_id_nax2<block_q4_K, QK_NL, dequantize_q4_K, 2>;
+template [[host_name("kernel_mul_mm_id_nax2_q6_K_nb2")]] kernel mul_mm_id_nax2_t kernel_mul_mm_id_nax2<block_q6_K, QK_NL, dequantize_q6_K, 2>;
 #endif // GGML_METAL_HAS_TENSOR

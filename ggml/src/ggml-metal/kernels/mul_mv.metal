@@ -1527,7 +1527,17 @@ void kernel_mul_mv_q4_K_f32_impl(
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
+#ifdef MC15_MV_Q4K_SPLIT
+    // rows of only two blocks (K = 512): the two halves of the simdgroup take nr0 rows each instead of idling
+    const bool split = args.ne00 == 2*QK_K;
+    const short ngb = split ? 2 : 4;          // lane groups per row
+    const short ix  = (tiisg/8) % ngb;
+    const short rg  = split ? tiisg/16 : 0;
+#else
+    const short ngb = 4;
     const short ix = tiisg/8;  // 0...3
+    const short rg = 0;
+#endif
     const short it = tiisg%8;  // 0...7
     const short iq = it/4;     // 0 or 1
     const short ir = it%4;     // 0...3
@@ -1538,7 +1548,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * NSG + sgitg) * nr0;
+    const int first_row = ((r0 * NSG + sgitg) * (4/ngb) + rg) * nr0;
 
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
@@ -1559,7 +1569,11 @@ void kernel_mul_mv_q4_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    if (first_row >= args.ne0) {
+        return;
+    }
+
+    for (int ib = ix; ib < nb; ib += ngb) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
         for (short i = 0; i < 8; ++i) {
@@ -1606,14 +1620,24 @@ void kernel_mul_mv_q4_K_f32_impl(
             dh += args.nb01/2;
         }
 
-        y4 += 4 * QK_K;
+        y4 += ngb * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
 
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        float sum_all;
+        if (ngb == 4) {
+            sum_all = simd_sum(sumf[row]);
+        } else {
+            // sum over the 16 lanes of this half
+            sum_all = sumf[row];
+            sum_all += simd_shuffle_xor(sum_all, 1);
+            sum_all += simd_shuffle_xor(sum_all, 2);
+            sum_all += simd_shuffle_xor(sum_all, 4);
+            sum_all += simd_shuffle_xor(sum_all, 8);
+        }
+        if (tiisg % 16 == 0 && (ngb == 4 ? tiisg == 0 : true)) {
             dst_f32[first_row + row] = sum_all;
         }
     }
