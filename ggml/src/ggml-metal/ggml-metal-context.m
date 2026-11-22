@@ -471,6 +471,88 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// mc15 profiling only (GGML_METAL_OP_PROFILE=<file>): encode every op (fusion group) in its own command buffer,
+// wait for it and append one JSON line per graph with the GPU time per op label. Serial, no concurrency and one
+// commit per op, so the numbers attribute time between ops; they are not performance data.
+static enum ggml_status ggml_metal_graph_compute_profile(ggml_metal_t ctx, struct ggml_cgraph * gf, const char * path) {
+    if (ctx->cmd_buf_last) {
+        [ctx->cmd_buf_last waitUntilCompleted];
+        ctx->cmd_buf_last = nil;
+    }
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+    NSMutableDictionary<NSString *, NSMutableArray *> * acc = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> * order = [NSMutableArray array];
+    long n_tokens = 0, n_kv = 0;
+    double total = 0;
+    const int n = gf->n_nodes;
+    int i = 0;
+    while (i < n) {
+        const int end = MIN(i + 128, n);
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+            ggml_metal_op_t op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, i, end, false, false, 0);
+            const int nn = ggml_metal_op_n_nodes(op);
+            if (nn == 0) {
+                ggml_metal_op_free(op);
+                i = end;
+                continue;
+            }
+            const int first = ggml_metal_op_node_index(op, 0);
+            if (first + 40 > end && end < n) {
+                ggml_metal_op_free(op);
+                i = first;
+                continue;
+            }
+            const int res = ggml_metal_op_encode(op, 0);
+            const int next = res > 0 && res < nn ? ggml_metal_op_node_index(op, res) : end;
+            ggml_metal_op_free(op);
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                return GGML_STATUS_FAILED;
+            }
+            const double us = ([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime])*1e6;
+            const struct ggml_tensor * node = gf->nodes[first];
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && n_kv == 0) {
+                n_tokens = node->src[0]->ne[1];
+                n_kv     = node->src[1]->ne[1];
+            }
+            NSString * name = [NSString stringWithUTF8String:node->name];
+            NSRange r = [name rangeOfString:@" ("];
+            if (r.location != NSNotFound) {
+                name = [name substringToIndex:r.location];
+            }
+            NSRegularExpression * re = [NSRegularExpression regularExpressionWithPattern:@"-[0-9]+$" options:0 error:nil];
+            name = [re stringByReplacingMatchesInString:name options:0 range:NSMakeRange(0, name.length) withTemplate:@""];
+            NSString * label = [NSString stringWithFormat:@"%s:%@%@", ggml_op_desc(node), name,
+                                res > 1 ? [NSString stringWithFormat:@"+%d", res - 1] : @""];
+            NSMutableArray * a = acc[label];
+            if (!a) {
+                a = [NSMutableArray arrayWithObjects:@0.0, @0, nil];
+                acc[label] = a;
+                [order addObject:label];
+            }
+            a[0] = @([a[0] doubleValue] + us);
+            a[1] = @([a[1] intValue] + 1);
+            total += us;
+            i = MAX(next, first + 1);
+        }
+    }
+    NSMutableArray * ops = [NSMutableArray array];
+    for (NSString * label in order) {
+        [ops addObject:@[label, acc[label][0], acc[label][1]]];
+    }
+    NSDictionary * line = @{@"n_nodes": @(n), @"n_tokens": @(n_tokens), @"n_kv": @(n_kv), @"total_us": @(total), @"ops": ops};
+    NSData * data = [NSJSONSerialization dataWithJSONObject:line options:0 error:nil];
+    FILE * f = fopen(path, "a");
+    if (f) {
+        fwrite(data.bytes, 1, data.length, f);
+        fputc('\n', f);
+        fclose(f);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -479,6 +561,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     if (gf->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
+    }
+
+    const char * op_profile = getenv("GGML_METAL_OP_PROFILE");
+    if (op_profile) {
+        return ggml_metal_graph_compute_profile(ctx, gf, op_profile);
     }
 
     // number of nodes encoded by the main thread (empirically determined)

@@ -25,6 +25,9 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+// graph index of the i-th non-empty node (used by the GGML_METAL_OP_PROFILE path)
+int ggml_metal_op_node_index(ggml_metal_op_t ctx, int i);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //

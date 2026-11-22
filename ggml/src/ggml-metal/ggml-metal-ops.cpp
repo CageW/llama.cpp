@@ -76,6 +76,11 @@ struct ggml_metal_op {
         return idxs.size();
     }
 
+    int idx(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
+    }
+
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
@@ -154,6 +159,10 @@ void ggml_metal_op_free(ggml_metal_op_t ctx) {
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
+}
+
+int ggml_metal_op_node_index(ggml_metal_op_t ctx, int i) {
+    return ctx->idx(i);
 }
 
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
