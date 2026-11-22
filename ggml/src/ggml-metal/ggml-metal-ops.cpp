@@ -4244,7 +4244,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
-        const int64_t nwg = 32;
+        // up to 128 KV splits for a few queries (the GQA NAX kernel), 32 otherwise
+        const int64_t nwg = ne01 <= 8 ? 128 : 32;
         const int64_t ne01_max = std::min(ne01, 32);
 
         // temp buffer for writing the results from each workgroup
@@ -4650,8 +4651,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     if (gqa_wm > 0) {
         // KV splits: the partial results go to the temp buffer of the vec kernels, sized for 32 splits of up to 32 queries per head
-        const int nwg = std::min<int64_t>(32, 1024/ne01);
-        const int nwn = std::max(1, (int) (ne00/128));
+        // mc15 experiment: GGML_METAL_FA_GQA_NWG = 32/64/128 KV splits for up to 8 queries
+        static const int gqa_nwg = getenv("GGML_METAL_FA_GQA_NWG") ? atoi(getenv("GGML_METAL_FA_GQA_NWG")) : 32;
+        const int nwg = ne01 <= 8 ? std::min(128, gqa_nwg) : std::min<int64_t>(32, 1024/ne01);
+        static const int gqa_wnx = getenv("GGML_METAL_FA_GQA_WN2") ? atoi(getenv("GGML_METAL_FA_GQA_WN2")) : 0;
+        const int nwn = (gqa_wnx == 1 || gqa_wnx == 2 || gqa_wnx == 4) && ne00 == 128 && gqa_wm == 1 && op->src[1]->type == GGML_TYPE_F16 ?
+            (gqa_wnx == 1 ? 2 : gqa_wnx) : std::max(1, (int) (ne00/128));
         const int nsg = gqa_wm*nwn;
 
         GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
@@ -4695,7 +4700,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*std::min(nwg, 32), 1, 1);
         }
 
         return 1;
@@ -5086,6 +5091,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         } else {
             nwg = 32;
+            // mc15 experiment: GGML_METAL_FA_VEC_NWG_BLK = B gives each workgroup at least B blocks of ncpsg values
+            static const int nwg_blk = getenv("GGML_METAL_FA_VEC_NWG_BLK") ? atoi(getenv("GGML_METAL_FA_VEC_NWG_BLK")) : 0;
+            if (nwg_blk > 0) {
+                nwg = std::max<int32_t>(1, std::min<int32_t>(32, (ne11_attn + ncpsg*nwg_blk - 1)/(ncpsg*nwg_blk)));
+            }
             nsg = 1;
             while (2*nwg*nsg*ncpsg < ne11_attn && nsg < 4) {
                 nsg *= 2;
@@ -5194,7 +5204,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*std::min(nwg, 32), 1, 1);
             }
         }
     }

@@ -14045,7 +14045,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 110592, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
     // mc15: MiniCPM5-15B prefill at the served ubatch (2048 tokens): FA, every MUL_MAT / MUL_MAT_ID of a layer, and the
     // f16 reference GEMM below and above the 1024-row NAX threshold
-    for (int kv : {2048, 16384, 40960, 110592}) {
+    for (int kv : {2048, 4096, 8192, 16384, 40960, 110592}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_prefill_mask(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }

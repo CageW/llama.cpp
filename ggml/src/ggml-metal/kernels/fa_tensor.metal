@@ -1572,6 +1572,9 @@ kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<T, dk, dk, wn, wm>
     FA_NAX_GQA_WM(name, T, 256, 2, 8)
 
 FA_NAX_GQA(f16,  half)
+// mc15 experiment: head size 128 split over two simdgroups (GGML_METAL_FA_GQA_WN2)
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm1_wn2")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 128, 128, 2, 1>;
+template [[host_name("kernel_flash_attn_ext_nax_gqa_f16_dk128_dv128_wm1_wn4")]] kernel flash_attn_ext_nax_gqa_t kernel_flash_attn_ext_nax_gqa<half, 128, 128, 4, 1>;
 FA_NAX_GQA(bf16, bfloat)
 
 // quantized caches (decode and small batches; larger batches convert the cache to f16 first)

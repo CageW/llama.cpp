@@ -2019,6 +2019,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_n
     // wm > 0: the GQA variant with wm tiles of 16 query rows
     if (wm > 0) {
         snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_%s_dk%d_dv%d_wm%d", kv, dk, dv, wm);
+        // mc15 experiment: GGML_METAL_FA_GQA_WN2 = 1 splits head size 128 over two simdgroups (f16, wm 1)
+        static const int wnx = getenv("GGML_METAL_FA_GQA_WN2") ? atoi(getenv("GGML_METAL_FA_GQA_WN2")) : 0;
+        if ((wnx == 1 || wnx == 2 || wnx == 4) && dk == 128 && wm == 1 && op->src[1]->type == GGML_TYPE_F16) {
+            snprintf(base, 256, "kernel_flash_attn_ext_nax_gqa_%s_dk%d_dv%d_wm%d_wn%d", kv, dk, dv, wm, wnx == 1 ? 2 : wnx);
+        }
     } else {
         snprintf(base, 256, "kernel_flash_attn_ext_nax_%s_dk%d_dv%d", kv, dk, dv);
     }
