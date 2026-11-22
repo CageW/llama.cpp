@@ -13585,6 +13585,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048,  9, 32));
     test_cases.emplace_back(new test_moe_reduce(2048, 12, 32, false, true));
 
+    // mc15: the expert mat-vecs with 4 rows per simdgroup and, for q4_K rows of two blocks, the split-lane path;
+    // row counts not a multiple of the rows of a threadgroup
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int m : {2048, 200, 21}) {
+            for (int k : {512, 2048}) {
+                for (int n : {1, 3}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, m, n, k));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -14033,7 +14045,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 110592, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // MiniCPM5-15B decode/prefill (2 KV heads x GQA 16)
     // mc15: MiniCPM5-15B prefill at the served ubatch (2048 tokens): FA, every MUL_MAT / MUL_MAT_ID of a layer, and the
     // f16 reference GEMM below and above the 1024-row NAX threshold
-    for (int kv : {2048, 16384, 40960, 110592}) {
+    for (int kv : {2048, 4096, 8192, 16384, 40960, 110592}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_prefill_mask(128, 128, 2, {16, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
@@ -14054,7 +14066,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              {GGML_TYPE_Q6_K, 2048, 8192},  // layer 0 ffn_down
          }) {
         test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, 2048, c.k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, 1, c.k, {1, 1}, {1, 1})); // decode
     }
+    // mc15: the expert mat-vecs of one decode token
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 1, 512));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 2048, 2048));   // ffn_up_exps, ffn_gate_exps
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps (half the layers)
