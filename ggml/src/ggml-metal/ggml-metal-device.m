@@ -479,6 +479,20 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
 #endif
 
+    // mc15 experiments only: GGML_METAL_DEFINES="A=1,B=2" adds preprocessor macros to the kernel sources
+    {
+        const char * defs = getenv("GGML_METAL_DEFINES");
+        if (defs) {
+            for (NSString * kv in [[NSString stringWithUTF8String:defs] componentsSeparatedByString:@","]) {
+                NSArray * p = [kv componentsSeparatedByString:@"="];
+                if ([p[0] length] > 0) {
+                    [prep setObject:(p.count > 1 ? p[1] : @"1") forKey:p[0]];
+                    GGML_LOG_INFO("%s: GGML_METAL_DEFINES %s\n", __func__, [kv UTF8String]);
+                }
+            }
+        }
+    }
+
 #if GGML_METAL_EMBED_LIBRARY
     GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
 

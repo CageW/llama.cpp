@@ -991,6 +991,84 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
 
+// mc15 experiment (MC15_MMID_PF): the raw bytes one thread dequantizes per K step of kernel_mul_mm_id, loaded into
+// registers one step ahead so that the loads of step k+1 are in flight while the matrix units run step k
+template <typename block_q>
+struct mmid_pf {
+    static constexpr bool ok() { return false; }
+    struct regs { };
+    static regs load(device const block_q *, short) { return regs{}; }
+    template <typename S0_4x4> static void dequant(thread const regs &, short, thread S0_4x4 &) { }
+};
+
+template <>
+struct mmid_pf<block_q4_K> {
+    static constexpr bool ok() { return true; }
+    struct regs { uint32_t dm; uint32_t sc[3]; uint32_t q[4]; };
+    static regs load(device const block_q4_K * xb, short il) {
+        regs r;
+        device const uint32_t * b = (device const uint32_t *) xb; // d, dmin, then the 12 scale bytes: 4-byte aligned
+        r.dm = b[0];
+        r.sc[0] = b[1]; r.sc[1] = b[2]; r.sc[2] = b[3];
+        device const uint32_t * q = (device const uint32_t *) (xb->qs + (il/4)*32 + 16*(il&1));
+        r.q[0] = q[0]; r.q[1] = q[1]; r.q[2] = q[2]; r.q[3] = q[3];
+        return r;
+    }
+    template <typename S0_4x4> static void dequant(thread const regs & r, short il, thread S0_4x4 & reg) {
+        thread const uchar * scales = (thread const uchar *) r.sc;
+        const short is = (il/4) * 2;
+        il = il & 3;
+        const short j = is, k = il/2;
+        const uchar2 sc = j < 4 ? uchar2{uchar(scales[j+0+k] & 63), uchar(scales[j+4+k] & 63)}
+                                : uchar2{uchar((scales[j+4+k] & 0xF) | ((scales[j-4+k] & 0xc0) >> 2)), uchar((scales[j+4+k] >> 4) | ((scales[j-0+k] & 0xc0) >> 2))};
+        const half2 dm = as_type<half2>(r.dm);
+        const float d   = il < 2 ? (float) dm[0] : (float) dm[0] / 16.f;
+        const float dl  = d * sc[0];
+        const float ml  = (float) dm[1] * sc[1];
+        thread const uchar * q = (thread const uchar *) r.q;
+        const ushort mask = il < 2 ? 0x0F : 0xF0;
+        for (int i = 0; i < 16; ++i) {
+            reg[i/4][i%4] = dl * (q[i] & mask) - ml;
+        }
+    }
+};
+
+template <>
+struct mmid_pf<block_q6_K> {
+    static constexpr bool ok() { return true; }
+    struct regs { uint16_t ql[8]; uint16_t qh[8]; float sc; };
+    static regs load(device const block_q6_K * xb, short il) {
+        regs r; // q6_K blocks are 2-byte aligned only
+        device const uint16_t * ql = (device const uint16_t *) xb->ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+        device const uint16_t * qh = (device const uint16_t *) xb->qh + 16*(il/8) + 8*(il&1);
+        for (short i = 0; i < 8; ++i) { r.ql[i] = ql[i]; r.qh[i] = qh[i]; }
+        r.sc = (float) xb->d * (float) ((device const int8_t *) xb->scales)[(il%2) + 2*(il/2)];
+        return r;
+    }
+    template <typename S0_4x4> static void dequant(thread const regs & r, short il, thread S0_4x4 & reg) {
+        il = (il/2) & 3;
+        const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+        const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+        const float ml  = r.sc * 32.f;
+        const float dl0 = r.sc;
+        const float dl1 = dl0 / 256.f;
+        const float dl2 = dl0 / (256.f * 256.f);
+        const float dl3 = dl0 / (256.f * 256.f * 256.f);
+        const uint8_t shr_h = il>2 ? 2 : 0;
+        const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+        const uint8_t shr_l = il>1 ? 4 : 0;
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t  low = (r.ql[2*i] | (uint32_t)(r.ql[2*i+1] << 16)) & kmask2;
+            const uint32_t high = (r.qh[2*i] | (uint32_t)(r.qh[2*i+1] << 16)) & kmask1;
+            const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+            reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
+            reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
+            reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
+            reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+        }
+    }
+};
+
 // TODO: refactor into two seperate functions to avoid ifdef branching: with and without tensor support
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
@@ -1127,6 +1205,76 @@ kernel void kernel_mul_mm_id(
     auto cT3 = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB3), float>();
 #endif
 
+#if defined(GGML_METAL_HAS_TENSOR) && defined(MC15_MMID_PF)
+    if (mmid_pf<block_q>::ok() && !FC_mul_mm_bc_inp) {
+        typename mmid_pf<block_q>::regs ra = mmid_pf<block_q>::load(x, il);
+        T1_2x4 rb  = *((device T1_2x4 *) y);
+        T1_2x4 rb2 = FC_mul_mm_id_wide ? *((device T1_2x4 *) y2) : T1_2x4(0);
+
+        for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+            S0_4x4 temp_a;
+            mmid_pf<block_q>::dequant(ra, il, temp_a);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short sx = 2*il0 + i/8;
+                const short sy = (tiitg/NL0)/8;
+
+                const short lx = i%8;
+                const short ly = (tiitg/NL0)%8;
+
+                *(sa + NK*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
+            }
+
+            {
+                const short sx = (tiitg%NL1);
+                const short sy = (tiitg/NL1)/8;
+                const short ly = (tiitg/NL1)%8;
+
+                *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4) rb;
+                if (FC_mul_mm_id_wide) {
+                    *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly + 32) + 8*sx) = (S1_2x4) rb2;
+                }
+            }
+
+            il = (il + 2 < nl) ? il + 2 : il % 2;
+            x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+
+            y  += NK;
+            y2 += NK;
+
+            // the next step's raw weights and activations, in flight during this step's matrix multiply
+            if (loop_k + NK < args.ne00) {
+                ra = mmid_pf<block_q>::load(x, il);
+                rb = *((device T1_2x4 *) y);
+                if (FC_mul_mm_id_wide) {
+                    rb2 = *((device T1_2x4 *) y2);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto sA  = tA.slice(0, 0);
+            auto sB0 = tB0.slice(0, 0);
+
+            mm.run(sB0, sA, cT0);
+
+            if (nr1 > 1*NR1Q) {
+                auto sB1 = tB1.slice(0, 0);
+                mm.run(sB1, sA, cT1);
+            }
+            if (nr1 > 2*NR1Q) {
+                auto sB2 = tB2.slice(0, 0);
+                mm.run(sB2, sA, cT2);
+            }
+            if (nr1 > 3*NR1Q) {
+                auto sB3 = tB3.slice(0, 0);
+                mm.run(sB3, sA, cT3);
+            }
+        }
+    } else
+#endif
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
 #ifndef GGML_METAL_HAS_TENSOR
         // load data and store to threadgroup memory

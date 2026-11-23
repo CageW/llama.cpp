@@ -14085,6 +14085,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true, 512, 2048, 2048));   // ffn_up_exps, ffn_gate_exps
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));  // ffn_down_exps (half the layers)
+    // mc15: the expert GEMMs at the prefill chunk sizes a long-session turn sees (139-3995 new tokens, ubatch 2048)
+    for (int n : {128, 256, 512, 1024}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, true,  512,  n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 160, 16, false, 2048, n, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 160, 16, false, 2048, n, 512));
+    }
     // mc15 E2 probes: the same expert GEMMs with f16 and q8_0 weights, to tell the dequantization cost from the tiling
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 160, 16, true,  512,  2048, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 160, 16, false, 2048, 2048, 512));
